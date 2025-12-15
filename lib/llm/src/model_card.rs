@@ -231,6 +231,13 @@ pub struct ModelDeploymentCard {
     #[serde(default)]
     pub media_fetcher: Option<MediaFetcher>,
 
+    /// For LoRA adapters, the base model name (e.g., "Qwen/Qwen2.5-1.5B-Instruct").
+    /// Used by the frontend to download config files (tokenizer, etc.) since LoRAs
+    /// share these with their base model. Without this, the frontend would try to
+    /// download configs using the LoRA's display_name which is not a valid HF model ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_model_name: Option<String>,
+
     #[serde(skip, default)]
     checksum: OnceLock<String>,
 }
@@ -386,6 +393,9 @@ impl ModelDeploymentCard {
     }
 
     /// Download the files this card needs to work: config.json, tokenizer.json, etc.
+    ///
+    /// For LoRA adapters, this uses `base_model_name` (if set) to download configs
+    /// from the base model, since LoRAs share tokenizer/config with their base.
     pub async fn download_config(&mut self) -> anyhow::Result<()> {
         if self.has_local_files() {
             tracing::trace!("All model config is local, not downloading");
@@ -401,8 +411,22 @@ impl ModelDeploymentCard {
             return Ok(());
         }
 
+        // For LoRA adapters, use base_model_name for config download since LoRAs
+        // share tokenizer/config with their base model. The display_name for LoRAs
+        // (e.g., "Qwen/Qwen2.5-1.5B-Instruct:guanaco") is not a valid HuggingFace ID.
+        let hf_model_id = self
+            .base_model_name
+            .as_deref()
+            .unwrap_or(&self.display_name);
+
+        tracing::debug!(
+            display_name = %self.display_name,
+            hf_model_id = %hf_model_id,
+            "Downloading model config from HuggingFace"
+        );
+
         let ignore_weights = true;
-        let local_path = crate::hub::from_hf(&self.display_name, ignore_weights).await?;
+        let local_path = crate::hub::from_hf(hf_model_id, ignore_weights).await?;
 
         self.update_dir(&local_path);
         Ok(())
@@ -562,6 +586,7 @@ impl ModelDeploymentCard {
             runtime_config: ModelRuntimeConfig::default(),
             media_decoder: None,
             media_fetcher: None,
+            base_model_name: None, // set by caller for LoRA adapters
             checksum: OnceLock::new(),
         })
     }
