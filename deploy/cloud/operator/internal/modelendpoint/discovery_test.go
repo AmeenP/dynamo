@@ -434,6 +434,136 @@ func TestExtractCandidates(t *testing.T) {
 				"service-2": true,
 			},
 		},
+		{
+			name: "deduplicates same pod across multiple EndpointSlices",
+			endpointSlices: &discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								discoveryv1.LabelServiceName: "model-service",
+							},
+						},
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.1.5"},
+								Conditions: discoveryv1.EndpointConditions{
+									Ready: &trueVal,
+								},
+								TargetRef: &corev1.ObjectReference{
+									Kind: "Pod",
+									Name: testPodWorker0,
+								},
+							},
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								discoveryv1.LabelServiceName: "worker-service",
+							},
+						},
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								// Same pod and address as above - should be deduplicated
+								Addresses: []string{"10.0.1.5"},
+								Conditions: discoveryv1.EndpointConditions{
+									Ready: &trueVal,
+								},
+								TargetRef: &corev1.ObjectReference{
+									Kind: "Pod",
+									Name: testPodWorker0,
+								},
+							},
+						},
+					},
+				},
+			},
+			port:               9090,
+			expectedCandidates: 1, // Only one despite appearing in two EndpointSlices
+			expectedServiceNames: map[string]bool{
+				"model-service":  true,
+				"worker-service": true,
+			},
+			validateCandidates: func(t *testing.T, candidates []Candidate) {
+				if len(candidates) != 1 {
+					t.Fatalf("expected 1 candidate after deduplication, got %d", len(candidates))
+				}
+				if candidates[0].PodName != testPodWorker0 {
+					t.Errorf("expected podName %s, got %s", testPodWorker0, candidates[0].PodName)
+				}
+				if candidates[0].Address != "http://10.0.1.5:9090" {
+					t.Errorf("expected address http://10.0.1.5:9090, got %s", candidates[0].Address)
+				}
+			},
+		},
+		{
+			name: "deduplicates same pod but keeps different addresses",
+			endpointSlices: &discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								discoveryv1.LabelServiceName: "service-1",
+							},
+						},
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								Addresses: []string{"10.0.1.5"},
+								Conditions: discoveryv1.EndpointConditions{
+									Ready: &trueVal,
+								},
+								TargetRef: &corev1.ObjectReference{
+									Kind: "Pod",
+									Name: testPodWorker0,
+								},
+							},
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								discoveryv1.LabelServiceName: "service-2",
+							},
+						},
+						Endpoints: []discoveryv1.Endpoint{
+							{
+								// Same pod but different address - both should be kept
+								Addresses: []string{"10.0.2.5"},
+								Conditions: discoveryv1.EndpointConditions{
+									Ready: &trueVal,
+								},
+								TargetRef: &corev1.ObjectReference{
+									Kind: "Pod",
+									Name: testPodWorker0,
+								},
+							},
+						},
+					},
+				},
+			},
+			port:               9090,
+			expectedCandidates: 2, // Different addresses should both be kept
+			expectedServiceNames: map[string]bool{
+				"service-1": true,
+				"service-2": true,
+			},
+			validateCandidates: func(t *testing.T, candidates []Candidate) {
+				if len(candidates) != 2 {
+					t.Fatalf("expected 2 candidates (different addresses), got %d", len(candidates))
+				}
+				addresses := map[string]bool{}
+				for _, c := range candidates {
+					addresses[c.Address] = true
+					if c.PodName != testPodWorker0 {
+						t.Errorf("expected podName %s, got %s", testPodWorker0, c.PodName)
+					}
+				}
+				if !addresses["http://10.0.1.5:9090"] || !addresses["http://10.0.2.5:9090"] {
+					t.Errorf("expected both addresses to be present, got %v", addresses)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {

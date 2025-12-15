@@ -23,6 +23,41 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// DistributionStrategy defines how a model is distributed across endpoints
+// +kubebuilder:validation:Enum=all;fixed;percentage
+type DistributionStrategy string
+
+const (
+	// DistributionStrategyAll loads the model on all available endpoints (default, backward compatible)
+	DistributionStrategyAll DistributionStrategy = "all"
+	// DistributionStrategyFixed loads the model on a fixed number of endpoints
+	DistributionStrategyFixed DistributionStrategy = "fixed"
+	// DistributionStrategyPercentage loads the model on a percentage of available endpoints
+	DistributionStrategyPercentage DistributionStrategy = "percentage"
+)
+
+// DistributionSpec configures how a model is distributed across endpoints
+type DistributionSpec struct {
+	// Strategy determines how endpoints are selected for this model
+	// +kubebuilder:validation:Enum=all;fixed;percentage
+	// +kubebuilder:default=all
+	// +optional
+	Strategy DistributionStrategy `json:"strategy,omitempty"`
+
+	// Replicas is the number of endpoints to load this model on
+	// Only used when Strategy is "fixed"
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// Percentage of available endpoints to use (1-100)
+	// Only used when Strategy is "percentage"
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	Percentage *int32 `json:"percentage,omitempty"`
+}
+
 // DynamoModelSpec defines the desired state of DynamoModel
 type DynamoModelSpec struct {
 	// ModelName is the full model identifier (e.g., "meta-llama/Llama-3.3-70B-Instruct-lora")
@@ -43,6 +78,11 @@ type DynamoModelSpec struct {
 	// Source specifies the model source location (only applicable for lora model type)
 	// +optional
 	Source *ModelSource `json:"source,omitempty"`
+
+	// Distribution configures how this model is distributed across endpoints
+	// If not specified, defaults to loading on all endpoints (backward compatible)
+	// +optional
+	Distribution *DistributionSpec `json:"distribution,omitempty"`
 }
 
 // ModelSource defines the source location of a model
@@ -81,6 +121,15 @@ type DynamoModelStatus struct {
 
 	// TotalEndpoints is the total count of endpoints
 	TotalEndpoints int `json:"totalEndpoints"`
+
+	// TargetEndpoints is the list of pod names selected for this model based on distribution spec
+	// When distribution is set, only these endpoints will have the model loaded
+	// +optional
+	TargetEndpoints []string `json:"targetEndpoints,omitempty"`
+
+	// AvailableEndpoints is the total number of endpoints available for selection
+	// This may be higher than TotalEndpoints when distribution limits the selection
+	AvailableEndpoints int `json:"availableEndpoints,omitempty"`
 
 	// Conditions represents the latest available observations of the model's state
 	// +optional
@@ -143,4 +192,44 @@ func (m *DynamoModel) HasEndpoints() bool {
 // HasReadyEndpoints returns true if the model has any ready endpoints
 func (m *DynamoModel) HasReadyEndpoints() bool {
 	return m.Status.ReadyEndpoints > 0
+}
+
+// GetDistributionStrategy returns the effective distribution strategy
+// Defaults to DistributionStrategyAll if not specified
+func (m *DynamoModel) GetDistributionStrategy() DistributionStrategy {
+	if m.Spec.Distribution == nil || m.Spec.Distribution.Strategy == "" {
+		return DistributionStrategyAll
+	}
+	return m.Spec.Distribution.Strategy
+}
+
+// GetTargetReplicas returns the target number of endpoints based on distribution spec
+// Takes the total available endpoints as input to calculate percentage-based targets
+func (m *DynamoModel) GetTargetReplicas(availableEndpoints int) int {
+	if m.Spec.Distribution == nil {
+		return availableEndpoints
+	}
+
+	switch m.Spec.Distribution.Strategy {
+	case DistributionStrategyFixed:
+		if m.Spec.Distribution.Replicas != nil {
+			target := int(*m.Spec.Distribution.Replicas)
+			if target > availableEndpoints {
+				return availableEndpoints
+			}
+			return target
+		}
+		return availableEndpoints
+	case DistributionStrategyPercentage:
+		if m.Spec.Distribution.Percentage != nil {
+			target := availableEndpoints * int(*m.Spec.Distribution.Percentage) / 100
+			if target < 1 {
+				return 1
+			}
+			return target
+		}
+		return availableEndpoints
+	default:
+		return availableEndpoints
+	}
 }

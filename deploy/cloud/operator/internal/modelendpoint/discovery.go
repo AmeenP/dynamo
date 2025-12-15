@@ -34,9 +34,11 @@ import (
 // ExtractCandidates extracts endpoint candidates from EndpointSlices
 // Returns all pod-backed endpoints regardless of ready status
 // The readiness will be determined by probing (for LoRA models) or set to false (for base models)
+// Deduplicates endpoints by podName+address to handle multiple EndpointSlices for the same pod
 func ExtractCandidates(endpointSlices *discoveryv1.EndpointSliceList, port int32) ([]Candidate, map[string]bool) {
 	var candidates []Candidate
 	serviceNames := make(map[string]bool)
+	seen := make(map[string]bool) // key: "podName:address" for deduplication
 
 	for _, slice := range endpointSlices.Items {
 		serviceName := slice.Labels[discoveryv1.LabelServiceName]
@@ -57,6 +59,14 @@ func ExtractCandidates(endpointSlices *discoveryv1.EndpointSliceList, port int32
 
 			for _, addr := range ep.Addresses {
 				address := "http://" + net.JoinHostPort(addr, strconv.Itoa(int(port)))
+
+				// Deduplicate by podName + address
+				key := podName + ":" + address
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+
 				candidates = append(candidates, Candidate{
 					Address: address,
 					PodName: podName,

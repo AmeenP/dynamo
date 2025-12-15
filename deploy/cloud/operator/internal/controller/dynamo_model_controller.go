@@ -163,6 +163,8 @@ func (r *DynamoModelReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		model.Status.Endpoints = nil
 		model.Status.TotalEndpoints = 0
 		model.Status.ReadyEndpoints = 0
+		model.Status.TargetEndpoints = nil
+		model.Status.AvailableEndpoints = 0
 		if err := r.Status().Update(ctx, model); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -170,8 +172,15 @@ func (r *DynamoModelReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	// Load LoRA on all endpoints in parallel with bounded concurrency
-	allEndpoints, probeErr := r.EndpointClient.LoadLoRA(ctx, candidates, model)
+	// Select target endpoints based on distribution spec
+	// For models with distribution, only a subset of endpoints will be selected
+	targetCandidates := modelendpoint.SelectTargetEndpoints(model, candidates)
+
+	// Store the total available for status reporting
+	availableCount := len(candidates)
+
+	// Load LoRA on selected endpoints in parallel with bounded concurrency
+	allEndpoints, probeErr := r.EndpointClient.LoadLoRA(ctx, targetCandidates, model)
 
 	// Determine if we need to requeue based on model type
 	// For LoRA models: requeue if there were probe errors OR if not all endpoints are ready
@@ -180,6 +189,10 @@ func (r *DynamoModelReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if model.IsLoRA() {
 		hasFailures = hasFailures || countReadyEndpoints(allEndpoints) < len(allEndpoints)
 	}
+
+	// Update target endpoints in status
+	model.Status.TargetEndpoints = modelendpoint.ExtractPodNames(targetCandidates)
+	model.Status.AvailableEndpoints = availableCount
 
 	if probeErr != nil {
 		logs.Error(probeErr, "Some endpoints failed during probing")
@@ -236,7 +249,9 @@ func (r *DynamoModelReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	logs.Info("Successfully reconciled DynamoModel",
 		"totalEndpoints", model.Status.TotalEndpoints,
-		"readyEndpoints", model.Status.ReadyEndpoints)
+		"readyEndpoints", model.Status.ReadyEndpoints,
+		"availableEndpoints", model.Status.AvailableEndpoints,
+		"distributionStrategy", model.GetDistributionStrategy())
 
 	// Requeue if there were probe failures to retry loading LoRAs
 	if hasFailures {
@@ -351,21 +366,35 @@ func (r *DynamoModelReconciler) FinalizeResource(ctx context.Context, model *v1a
 			r.Recorder.Event(model, corev1.EventTypeWarning, "CleanupFailed", err.Error())
 			// Continue with deletion even if we can't get endpoints
 		} else if len(candidates) > 0 {
-			logs.Info("Unloading LoRA from endpoints", "endpointCount", len(candidates))
+			// Only unload from endpoints that were targets for this model
+			// If TargetEndpoints is set, filter to only those endpoints
+			unloadCandidates := candidates
+			if len(model.Status.TargetEndpoints) > 0 {
+				unloadCandidates = modelendpoint.FilterByPodNames(candidates, model.Status.TargetEndpoints)
+				logs.Info("Filtering unload to target endpoints",
+					"allEndpoints", len(candidates),
+					"targetEndpoints", len(unloadCandidates))
+			}
 
-			// Unload LoRA from all endpoints in parallel
-			if err := r.EndpointClient.UnloadLoRA(ctx, candidates, model.Spec.ModelName); err != nil {
-				// Log as Info since we're continuing with deletion anyway (expected behavior)
-				// Detailed failure information is already logged by the prober
-				logs.Info("Some endpoints failed to unload LoRA, continuing with deletion",
-					"error", err.Error())
-				r.Recorder.Event(model, corev1.EventTypeWarning, "LoRAUnloadFailed",
-					fmt.Sprintf("Failed to unload LoRA from some endpoints: %v", err))
-				// Continue with deletion even if unload fails
+			if len(unloadCandidates) > 0 {
+				logs.Info("Unloading LoRA from endpoints", "endpointCount", len(unloadCandidates))
+
+				// Unload LoRA from target endpoints in parallel
+				if err := r.EndpointClient.UnloadLoRA(ctx, unloadCandidates, model.Spec.ModelName); err != nil {
+					// Log as Info since we're continuing with deletion anyway (expected behavior)
+					// Detailed failure information is already logged by the prober
+					logs.Info("Some endpoints failed to unload LoRA, continuing with deletion",
+						"error", err.Error())
+					r.Recorder.Event(model, corev1.EventTypeWarning, "LoRAUnloadFailed",
+						fmt.Sprintf("Failed to unload LoRA from some endpoints: %v", err))
+					// Continue with deletion even if unload fails
+				} else {
+					logs.Info("Successfully unloaded LoRA from all target endpoints")
+					r.Recorder.Event(model, corev1.EventTypeNormal, "LoRAUnloaded",
+						fmt.Sprintf("Unloaded LoRA from %d endpoint(s)", len(unloadCandidates)))
+				}
 			} else {
-				logs.Info("Successfully unloaded LoRA from all endpoints")
-				r.Recorder.Event(model, corev1.EventTypeNormal, "LoRAUnloaded",
-					fmt.Sprintf("Unloaded LoRA from %d endpoint(s)", len(candidates)))
+				logs.Info("No target endpoints found for cleanup")
 			}
 		} else {
 			logs.Info("No endpoints found for cleanup")
