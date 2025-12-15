@@ -312,10 +312,12 @@ fn register_llm<'p>(
         ));
     }
 
-    // Determine source_path and lora_identifier based on registration mode
-    let (source_path, lora_identifier) = match (lora_name, base_model_path) {
-        (Some(lora), Some(base)) => (base.to_string(), Some(lora.to_string())),
-        _ => (inner_path, None),
+    // Determine source_path, lora_identifier, and base_model_name based on registration mode
+    // For LoRA adapters: source_path is the base model, lora_identifier is the LoRA name
+    // base_model_name is set so frontend can download configs using the base model's HF ID
+    let (source_path, lora_identifier, base_model_name) = match (lora_name, base_model_path) {
+        (Some(lora), Some(base)) => (base.to_string(), Some(lora.to_string()), Some(base.to_string())),
+        _ => (inner_path, None, None),
     };
 
     // Model name: use lora name if present, otherwise provided name or default to source path
@@ -372,7 +374,8 @@ fn register_llm<'p>(
             .user_data(user_data_json)
             .custom_template_path(custom_template_path_owned)
             .media_decoder(media_decoder.map(|m| m.inner))
-            .media_fetcher(media_fetcher.map(|m| m.inner));
+            .media_fetcher(media_fetcher.map(|m| m.inner))
+            .base_model_name(base_model_name);
 
         let mut local_model = builder.build().await.map_err(to_pyerr)?;
         local_model

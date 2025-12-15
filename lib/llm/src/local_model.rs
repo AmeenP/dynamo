@@ -56,6 +56,8 @@ pub struct LocalModelBuilder {
     custom_backend_metrics_polling_interval: Option<f64>,
     media_decoder: Option<MediaDecoder>,
     media_fetcher: Option<MediaFetcher>,
+    /// For LoRA adapters, the base model name used to download config files
+    base_model_name: Option<String>,
 }
 
 impl Default for LocalModelBuilder {
@@ -83,6 +85,7 @@ impl Default for LocalModelBuilder {
             custom_backend_metrics_polling_interval: Default::default(),
             media_decoder: Default::default(),
             media_fetcher: Default::default(),
+            base_model_name: Default::default(),
         }
     }
 }
@@ -200,6 +203,14 @@ impl LocalModelBuilder {
         self
     }
 
+    /// Set the base model name for LoRA adapters.
+    /// This is used by the frontend to download config files (tokenizer, etc.)
+    /// since LoRAs share these with their base model.
+    pub fn base_model_name(&mut self, base_model_name: Option<String>) -> &mut Self {
+        self.base_model_name = base_model_name;
+        self
+    }
+
     /// Make an LLM ready for use:
     /// - Download it from Hugging Face (and NGC in future) if necessary
     /// - Resolve the path
@@ -303,6 +314,7 @@ impl LocalModelBuilder {
         card.runtime_config = self.runtime_config.clone();
         card.media_decoder = self.media_decoder.clone();
         card.media_fetcher = self.media_fetcher.clone();
+        card.base_model_name = self.base_model_name.take();
 
         Ok(LocalModel {
             card,
