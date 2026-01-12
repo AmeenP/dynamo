@@ -368,8 +368,18 @@ async fn load_lora_handler(
     .await
     {
         Ok(response) => {
-            tracing::info!("LoRA loaded successfully: {}", request.lora_name);
-            (StatusCode::OK, Json(response))
+            // Check if the operation actually succeeded by examining the response status
+            if response.status == "error" {
+                tracing::error!(
+                    "Failed to load LoRA {}: {}",
+                    request.lora_name,
+                    response.message.as_deref().unwrap_or("Unknown error")
+                );
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(response))
+            } else {
+                tracing::info!("LoRA loaded successfully: {}", request.lora_name);
+                (StatusCode::OK, Json(response))
+            }
         }
         Err(e) => {
             tracing::error!("Failed to load LoRA {}: {}", request.lora_name, e);
@@ -412,8 +422,18 @@ async fn unload_lora_handler(
     .await
     {
         Ok(response) => {
-            tracing::info!("LoRA unloaded successfully: {}", lora_name);
-            (StatusCode::OK, Json(response))
+            // Check if the operation actually succeeded by examining the response status
+            if response.status == "error" {
+                tracing::error!(
+                    "Failed to unload LoRA {}: {}",
+                    lora_name,
+                    response.message.as_deref().unwrap_or("Unknown error")
+                );
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(response))
+            } else {
+                tracing::info!("LoRA unloaded successfully: {}", lora_name);
+                (StatusCode::OK, Json(response))
+            }
         }
         Err(e) => {
             tracing::error!("Failed to unload LoRA {}: {}", lora_name, e);
