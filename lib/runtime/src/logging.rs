@@ -25,6 +25,24 @@
 //! "test_logging" = "info"
 //! "test_logging::api" = "trace"
 //! ```
+//!
+//! ## Per-Request Debug Logging
+//!
+//! The `x-pi-debug` header enables debug or trace logging for individual requests without
+//! changing global log levels. This is useful for debugging production issues without
+//! flooding logs.
+//!
+//! Header values:
+//! - `1`, `true`, `yes`, `on`, `debug` → Enable DEBUG level for this request
+//! - `trace` → Enable TRACE level for this request
+//!
+//! Example:
+//! ```bash
+//! curl -H "x-pi-debug: trace" http://localhost:8000/v1/chat/completions
+//! ```
+//!
+//! Use [`is_debug_mode()`] or [`get_request_debug_level()`] to check the current request's
+//! debug level in your code.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Once;
@@ -103,6 +121,50 @@ const DEFAULT_OTEL_SERVICE_NAME: &str = "dynamo";
 /// Once instance to ensure the logger is only initialized once
 static INIT: Once = Once::new();
 
+/// Debug level for per-request debug logging via x-pi-debug header.
+///
+/// This allows enabling debug or trace logging for individual requests without
+/// changing global log levels - useful for debugging production issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RequestDebugLevel {
+    /// No per-request debug logging (default behavior, use global log level)
+    #[default]
+    None,
+    /// Enable DEBUG level logging for this request
+    Debug,
+    /// Enable TRACE level logging for this request (most verbose)
+    Trace,
+}
+
+impl RequestDebugLevel {
+    /// Parse the x-pi-debug header value into a debug level.
+    ///
+    /// - `1`, `true`, `yes`, `on`, `debug` → Debug
+    /// - `trace` → Trace
+    /// - anything else → None
+    pub fn from_header_value(value: &str) -> Self {
+        match value.to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" | "debug" => RequestDebugLevel::Debug,
+            "trace" => RequestDebugLevel::Trace,
+            _ => RequestDebugLevel::None,
+        }
+    }
+
+    /// Returns true if any debug logging is enabled (Debug or Trace)
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, RequestDebugLevel::None)
+    }
+
+    /// Returns the tracing Level this debug level corresponds to
+    pub fn to_level(&self) -> Option<tracing::Level> {
+        match self {
+            RequestDebugLevel::None => None,
+            RequestDebugLevel::Debug => Some(tracing::Level::DEBUG),
+            RequestDebugLevel::Trace => Some(tracing::Level::TRACE),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct LoggingConfig {
     log_level: String,
@@ -173,6 +235,13 @@ pub struct DistributedTraceContext {
     pub x_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub x_dynamo_request_id: Option<String>,
+    /// Per-request debug level from x-pi-debug header
+    #[serde(default, skip_serializing_if = "is_debug_level_none")]
+    pub x_pi_debug: RequestDebugLevel,
+}
+
+fn is_debug_level_none(level: &RequestDebugLevel) -> bool {
+    matches!(level, RequestDebugLevel::None)
 }
 
 /// Pending context data collected in on_new_span, to be finalized in on_enter
@@ -184,6 +253,7 @@ struct PendingDistributedTraceContext {
     tracestate: Option<String>,
     x_request_id: Option<String>,
     x_dynamo_request_id: Option<String>,
+    x_pi_debug: RequestDebugLevel,
 }
 
 /// Macro to emit a tracing event at a dynamic level with a custom target.
@@ -232,6 +302,8 @@ pub struct TraceParent {
     pub tracestate: Option<String>,
     pub x_request_id: Option<String>,
     pub x_dynamo_request_id: Option<String>,
+    /// Per-request debug level from x-pi-debug header
+    pub x_pi_debug: RequestDebugLevel,
 }
 
 pub trait GenericHeaders {
@@ -257,6 +329,7 @@ impl TraceParent {
         let mut tracestate = None;
         let mut x_request_id = None;
         let mut x_dynamo_request_id = None;
+        let mut x_pi_debug = RequestDebugLevel::None;
 
         if let Some(header_value) = headers.get("traceparent") {
             (trace_id, parent_id) = parse_traceparent(header_value);
@@ -274,6 +347,11 @@ impl TraceParent {
             x_dynamo_request_id = Some(header_value.to_string());
         }
 
+        // Parse x-pi-debug header for per-request debug logging
+        if let Some(header_value) = headers.get("x-pi-debug") {
+            x_pi_debug = RequestDebugLevel::from_header_value(header_value);
+        }
+
         // Validate UUID format
         let x_dynamo_request_id =
             x_dynamo_request_id.filter(|id| uuid::Uuid::parse_str(id).is_ok());
@@ -283,6 +361,7 @@ impl TraceParent {
             tracestate,
             x_request_id,
             x_dynamo_request_id,
+            x_pi_debug,
         }
     }
 }
@@ -296,6 +375,13 @@ pub fn make_request_span<B>(req: &Request<B>) -> Span {
 
     let otel_context = extract_otel_context_from_http_headers(req.headers());
 
+    // Convert x_pi_debug to Option<&str> for span field (only include if enabled)
+    let x_pi_debug_str: Option<&'static str> = match trace_parent.x_pi_debug {
+        RequestDebugLevel::None => None,
+        RequestDebugLevel::Debug => Some("debug"),
+        RequestDebugLevel::Trace => Some("trace"),
+    };
+
     let span = tracing::info_span!(
         "http-request",
         method = %method,
@@ -305,6 +391,7 @@ pub fn make_request_span<B>(req: &Request<B>) -> Span {
         parent_id = trace_parent.parent_id,
         x_request_id = trace_parent.x_request_id,
         x_dynamo_request_id = trace_parent.x_dynamo_request_id,
+        x_pi_debug = x_pi_debug_str,
     );
 
     if let Some(context) = otel_context {
@@ -361,6 +448,13 @@ pub fn make_handle_payload_span(
     let (otel_context, trace_id, parent_span_id) = extract_otel_context_from_nats_headers(headers);
     let trace_parent = TraceParent::from_headers(headers);
 
+    // Convert x_pi_debug to Option<&str> for span field
+    let x_pi_debug_str: Option<&'static str> = match trace_parent.x_pi_debug {
+        RequestDebugLevel::None => None,
+        RequestDebugLevel::Debug => Some("debug"),
+        RequestDebugLevel::Trace => Some("trace"),
+    };
+
     if let (Some(trace_id), Some(parent_id)) = (trace_id.as_ref(), parent_span_id.as_ref()) {
         let span = tracing::info_span!(
             "handle_payload",
@@ -369,6 +463,7 @@ pub fn make_handle_payload_span(
             x_request_id = trace_parent.x_request_id,
             x_dynamo_request_id = trace_parent.x_dynamo_request_id,
             tracestate = trace_parent.tracestate,
+            x_pi_debug = x_pi_debug_str,
             component = component,
             endpoint = endpoint,
             namespace = namespace,
@@ -385,6 +480,7 @@ pub fn make_handle_payload_span(
             x_request_id = trace_parent.x_request_id,
             x_dynamo_request_id = trace_parent.x_dynamo_request_id,
             tracestate = trace_parent.tracestate,
+            x_pi_debug = x_pi_debug_str,
             component = component,
             endpoint = endpoint,
             namespace = namespace,
@@ -406,6 +502,17 @@ pub fn make_handle_payload_span_from_tcp_headers(
     let x_dynamo_request_id = headers.get("x-dynamo-request-id").cloned();
     let tracestate = headers.get("tracestate").cloned();
 
+    // Parse x-pi-debug from TCP headers
+    let x_pi_debug = headers
+        .get("x-pi-debug")
+        .map(|v| RequestDebugLevel::from_header_value(v))
+        .unwrap_or(RequestDebugLevel::None);
+    let x_pi_debug_str: Option<&'static str> = match x_pi_debug {
+        RequestDebugLevel::None => None,
+        RequestDebugLevel::Debug => Some("debug"),
+        RequestDebugLevel::Trace => Some("trace"),
+    };
+
     if let (Some(trace_id), Some(parent_id)) = (trace_id.as_ref(), parent_span_id.as_ref()) {
         let span = tracing::info_span!(
             "handle_payload",
@@ -414,6 +521,7 @@ pub fn make_handle_payload_span_from_tcp_headers(
             x_request_id = x_request_id,
             x_dynamo_request_id = x_dynamo_request_id,
             tracestate = tracestate,
+            x_pi_debug = x_pi_debug_str,
             component = component,
             endpoint = endpoint,
             namespace = namespace,
@@ -430,6 +538,7 @@ pub fn make_handle_payload_span_from_tcp_headers(
             x_request_id = x_request_id,
             x_dynamo_request_id = x_dynamo_request_id,
             tracestate = tracestate,
+            x_pi_debug = x_pi_debug_str,
             component = component,
             endpoint = endpoint,
             namespace = namespace,
@@ -567,6 +676,17 @@ pub fn inject_trace_headers_into_map(headers: &mut std::collections::HashMap<Str
         if let Some(x_dynamo_request_id) = trace_context.x_dynamo_request_id {
             headers.insert("x-dynamo-request-id".to_string(), x_dynamo_request_id);
         }
+
+        // Propagate x-pi-debug to downstream services
+        match trace_context.x_pi_debug {
+            RequestDebugLevel::None => {}
+            RequestDebugLevel::Debug => {
+                headers.insert("x-pi-debug".to_string(), "debug".to_string());
+            }
+            RequestDebugLevel::Trace => {
+                headers.insert("x-pi-debug".to_string(), "trace".to_string());
+            }
+        }
     }
 }
 
@@ -678,6 +798,7 @@ where
             let mut x_request_id: Option<String> = None;
             let mut x_dynamo_request_id: Option<String> = None;
             let mut tracestate: Option<String> = None;
+            let mut x_pi_debug = RequestDebugLevel::None;
             let mut visitor = FieldVisitor::default();
             attrs.record(&mut visitor);
 
@@ -723,6 +844,11 @@ where
                 x_dynamo_request_id = Some(x_request_id_input.to_string());
             }
 
+            // Extract x_pi_debug for per-request debug logging
+            if let Some(x_pi_debug_input) = visitor.fields.get("x_pi_debug") {
+                x_pi_debug = RequestDebugLevel::from_header_value(x_pi_debug_input);
+            }
+
             // Inherit trace context from parent span if available
             if parent_id.is_none()
                 && let Some(parent_span_id) = ctx.current_span().id()
@@ -733,6 +859,10 @@ where
                     trace_id = Some(parent_tracing_context.trace_id.clone());
                     parent_id = Some(parent_tracing_context.span_id.clone());
                     tracestate = parent_tracing_context.tracestate.clone();
+                    // Inherit x_pi_debug from parent if not set on this span
+                    if !x_pi_debug.is_enabled() {
+                        x_pi_debug = parent_tracing_context.x_pi_debug;
+                    }
                 }
             }
 
@@ -753,6 +883,7 @@ where
                 tracestate,
                 x_request_id,
                 x_dynamo_request_id,
+                x_pi_debug,
             });
         }
     }
@@ -786,6 +917,7 @@ where
             let tracestate = pending.tracestate;
             let x_request_id = pending.x_request_id;
             let x_dynamo_request_id = pending.x_dynamo_request_id;
+            let x_pi_debug = pending.x_pi_debug;
 
             // Try to extract from OtelData if not already set
             // Need to drop extensions_mut to get immutable borrow for OtelData
@@ -838,6 +970,7 @@ where
                 end: None,
                 x_request_id,
                 x_dynamo_request_id,
+                x_pi_debug,
             });
 
             drop(extensions);
@@ -865,6 +998,49 @@ pub fn get_distributed_tracing_context() -> Option<DistributedTraceContext> {
                 })
         })
         .flatten()
+}
+
+/// Get the per-request debug level for the current span.
+///
+/// Returns the debug level set via the `x-pi-debug` header, or `None` if not in a span context.
+///
+/// # Example
+/// ```ignore
+/// if let Some(level) = get_request_debug_level() {
+///     if level.is_enabled() {
+///         // Do extra debug work
+///     }
+/// }
+/// ```
+pub fn get_request_debug_level() -> Option<RequestDebugLevel> {
+    get_distributed_tracing_context().map(|ctx| ctx.x_pi_debug)
+}
+
+/// Check if per-request debug mode is enabled for the current span.
+///
+/// Returns `true` if the `x-pi-debug` header was set to enable debug or trace logging.
+/// Returns `false` if not in a span context or debug mode is not enabled.
+///
+/// # Example
+/// ```ignore
+/// if is_debug_mode() {
+///     tracing::debug!("Extra debug info: {:?}", expensive_computation());
+/// }
+/// ```
+pub fn is_debug_mode() -> bool {
+    get_request_debug_level()
+        .map(|level| level.is_enabled())
+        .unwrap_or(false)
+}
+
+/// Check if per-request trace mode is enabled for the current span.
+///
+/// Returns `true` only if `x-pi-debug: trace` was set.
+/// Returns `false` for debug mode, no debug mode, or when not in a span context.
+pub fn is_trace_mode() -> bool {
+    get_request_debug_level()
+        .map(|level| matches!(level, RequestDebugLevel::Trace))
+        .unwrap_or(false)
 }
 
 /// Initialize the logger - must be called when Tokio runtime is available
